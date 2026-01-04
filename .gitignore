@@ -1,3 +1,5 @@
 out
 chirpy.code-workspace
 .env
+test.http
+http_server_mockup

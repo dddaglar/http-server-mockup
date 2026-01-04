@@ -9,9 +9,11 @@ import (
 	"os"
 	"strings"
 	"sync/atomic"
+	"time"
 
 	"github.com/google/uuid"
 
+	"github.com/dddaglar/http_server_mockup/internal/auth"
 	"github.com/dddaglar/http_server_mockup/internal/database"
 
 	"github.com/joho/godotenv"
@@ -22,6 +24,15 @@ import (
 type apiConfig struct {
 	fileserverHits atomic.Int32
 	db             *database.Queries
+	jwtSecret      string
+}
+
+type userHiddenPW struct {
+	ID        uuid.UUID `json:"id"`
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
+	Email     string    `json:"email"`
+	Token     string    `json:"token"`
 }
 
 func (cfg *apiConfig) middlewareMetricsInc(next http.Handler) http.Handler {
@@ -95,27 +106,51 @@ func replaceProfane(s string) string {
 
 func (cfg *apiConfig) usersHandler(w http.ResponseWriter, req *http.Request) {
 	decoder := json.NewDecoder(req.Body)
-	type usermail struct {
-		Email string `json:"email"`
+	type newuser struct {
+		Password string `json:"password"`
+		Email    string `json:"email"`
 	}
-	umail := usermail{}
+	umail := newuser{}
 	if err := decoder.Decode(&umail); err != nil {
-		respondWithError(w, 400, fmt.Sprintf(`{"error": %s}`, err))
+		respondWithError(w, 400, err.Error())
 		return
 	}
-	user, err := cfg.db.CreateUser(req.Context(), umail.Email)
+	hashedPW, err := auth.HashPassword(umail.Password)
 	if err != nil {
-		respondWithError(w, 400, fmt.Sprintf(`{"error": %s}`, err))
+		respondWithError(w, 500, fmt.Sprintf(`{"error": %s}`, err))
 		return
 	}
-	respondWithJSON(w, 201, user)
+	user, err := cfg.db.CreateUser(req.Context(), database.CreateUserParams{
+		Email:          umail.Email,
+		HashedPassword: hashedPW,
+	})
+	if err != nil {
+		respondWithError(w, 400, err.Error())
+		return
+	}
+	respondWithJSON(w, 201, userHiddenPW{
+		ID:        user.ID,
+		CreatedAt: user.CreatedAt,
+		UpdatedAt: user.UpdatedAt,
+		Email:     user.Email,
+		Token:     "", // do not return password hash
+	})
 }
 
 func (cfg *apiConfig) chirpsHandler(w http.ResponseWriter, req *http.Request) {
+	token, err := auth.GetBearerToken(req.Header)
+	if err != nil {
+		respondWithError(w, 401, "missing or invalid authorization header")
+		return
+	}
+	userID, err := auth.ValidateJWT(token, cfg.jwtSecret)
+	if err != nil {
+		respondWithError(w, 401, "invalid token")
+		return
+	}
 	decoder := json.NewDecoder(req.Body)
 	type chirp struct {
-		Body   string    `json:"body"`
-		UserID uuid.UUID `json:"user_id"`
+		Body string `json:"body"`
 	}
 	params := chirp{}
 	if err := decoder.Decode(&params); err != nil {
@@ -129,7 +164,7 @@ func (cfg *apiConfig) chirpsHandler(w http.ResponseWriter, req *http.Request) {
 	cleanedBody := replaceProfane(params.Body)
 	newChirp, err := cfg.db.CreateChirp(req.Context(), database.CreateChirpParams{
 		Body:   cleanedBody,
-		UserID: params.UserID,
+		UserID: userID,
 	})
 	if err != nil {
 		respondWithError(w, 500, err.Error())
@@ -147,6 +182,67 @@ func (cfg *apiConfig) getChirpsHandler(w http.ResponseWriter, req *http.Request)
 	respondWithJSON(w, 200, chirps)
 }
 
+func (cfg *apiConfig) singleChirpHandler(w http.ResponseWriter, req *http.Request) {
+	id, err := uuid.Parse(req.PathValue("chirpID"))
+	if err != nil {
+		respondWithError(w, 400, "Invalid chirp ID")
+		return
+	}
+	chirp, err := cfg.db.GetChirpByID(req.Context(), id)
+	if err != nil {
+		respondWithError(w, 404, "Chirp not found")
+		return
+	}
+	respondWithJSON(w, 200, chirp)
+}
+
+func (cfg *apiConfig) loginHandler(w http.ResponseWriter, req *http.Request) {
+	//accept this here: password, email
+	decoder := json.NewDecoder(req.Body)
+	type user struct {
+		Password         string `json:"password"`
+		Email            string `json:"email"`
+		ExpiresInSeconds int64  `json:"expires_in_seconds"`
+	}
+	params := user{}
+	if err := decoder.Decode(&params); err != nil {
+		respondWithError(w, 400, err.Error())
+		return
+	}
+	//get users entire data by email, then compare
+	newUser, err := cfg.db.GetUserByMail(req.Context(), params.Email)
+	if err != nil {
+		respondWithError(w, 400, err.Error())
+		return
+	}
+	ok, err := auth.CheckPasswordHash(params.Password, newUser.HashedPassword)
+	if err != nil {
+		respondWithError(w, 400, err.Error())
+		return
+	}
+	if !ok {
+		respondWithError(w, 401, "incorrect email or password")
+		return
+	}
+	expiration := params.ExpiresInSeconds
+	if expiration <= 0 || expiration > 3600 {
+		expiration = 3600
+	}
+	token, err := auth.MakeJWT(newUser.ID, cfg.jwtSecret, time.Duration(expiration*int64(time.Second)))
+	if err != nil {
+		respondWithError(w, 500, err.Error())
+		return
+	}
+	respondWithJSON(w, 200, userHiddenPW{
+		ID:        newUser.ID,
+		CreatedAt: newUser.CreatedAt,
+		UpdatedAt: newUser.UpdatedAt,
+		Email:     newUser.Email,
+		Token:     token,
+	})
+
+}
+
 func main() {
 	godotenv.Load()
 	dbURL := os.Getenv("DB_URL")
@@ -154,25 +250,32 @@ func main() {
 	if err != nil {
 		log.Fatal("error connecting to the databasev", err)
 	}
+
 	dbQueries := database.New(db)
+	jwtsecret := os.Getenv("SECRET_KEY")
+	apiCfg := apiConfig{db: dbQueries, jwtSecret: jwtsecret}
+
 	port := "8080"
 	serveMux := http.NewServeMux()
 	s := &http.Server{
 		Addr:    ":" + port,
 		Handler: serveMux,
 	}
-	apiCfg := apiConfig{db: dbQueries}
 	rootHandler := http.FileServer(http.Dir("."))
 	strippedAppHandler := http.StripPrefix("/app", rootHandler)
 	serveMux.Handle("/app/", apiCfg.middlewareMetricsInc(strippedAppHandler))
+
 	serveMux.Handle("GET /admin/metrics", http.HandlerFunc(apiCfg.metricHandler))
 	serveMux.Handle("POST /admin/reset", http.HandlerFunc(apiCfg.resetHandler))
 
 	serveMux.Handle("POST /api/chirps", http.HandlerFunc(apiCfg.chirpsHandler))
 	serveMux.Handle("GET /api/chirps", http.HandlerFunc(apiCfg.getChirpsHandler))
-	serveMux.Handle("GET /api/chirps/{chirpID}", http.HandlerFunc(apiCfg.getChirpsHandler))
+	serveMux.Handle("GET /api/chirps/{chirpID}", http.HandlerFunc(apiCfg.singleChirpHandler))
 
 	serveMux.Handle("POST /api/users", http.HandlerFunc(apiCfg.usersHandler))
+
+	serveMux.Handle("POST /api/login", http.HandlerFunc(apiCfg.loginHandler))
+
 	serveMux.HandleFunc("GET /api/healthz", func(w http.ResponseWriter, req *http.Request) {
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 		w.WriteHeader(http.StatusOK)
