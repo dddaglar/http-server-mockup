@@ -28,11 +28,12 @@ type apiConfig struct {
 }
 
 type userHiddenPW struct {
-	ID        uuid.UUID `json:"id"`
-	CreatedAt time.Time `json:"created_at"`
-	UpdatedAt time.Time `json:"updated_at"`
-	Email     string    `json:"email"`
-	Token     string    `json:"token"`
+	ID           uuid.UUID `json:"id"`
+	CreatedAt    time.Time `json:"created_at"`
+	UpdatedAt    time.Time `json:"updated_at"`
+	Email        string    `json:"email"`
+	Token        string    `json:"token"`
+	RefreshToken string    `json:"refresh_token"`
 }
 
 func (cfg *apiConfig) middlewareMetricsInc(next http.Handler) http.Handler {
@@ -129,11 +130,12 @@ func (cfg *apiConfig) usersHandler(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 	respondWithJSON(w, 201, userHiddenPW{
-		ID:        user.ID,
-		CreatedAt: user.CreatedAt,
-		UpdatedAt: user.UpdatedAt,
-		Email:     user.Email,
-		Token:     "", // do not return password hash
+		ID:           user.ID,
+		CreatedAt:    user.CreatedAt,
+		UpdatedAt:    user.UpdatedAt,
+		Email:        user.Email,
+		Token:        "", // do not return password hash
+		RefreshToken: "", // do not return refresh token
 	})
 }
 
@@ -200,9 +202,8 @@ func (cfg *apiConfig) loginHandler(w http.ResponseWriter, req *http.Request) {
 	//accept this here: password, email
 	decoder := json.NewDecoder(req.Body)
 	type user struct {
-		Password         string `json:"password"`
-		Email            string `json:"email"`
-		ExpiresInSeconds int64  `json:"expires_in_seconds"`
+		Password string `json:"password"`
+		Email    string `json:"email"`
 	}
 	params := user{}
 	if err := decoder.Decode(&params); err != nil {
@@ -224,23 +225,86 @@ func (cfg *apiConfig) loginHandler(w http.ResponseWriter, req *http.Request) {
 		respondWithError(w, 401, "incorrect email or password")
 		return
 	}
-	expiration := params.ExpiresInSeconds
-	if expiration <= 0 || expiration > 3600 {
-		expiration = 3600
+	token, err := auth.MakeJWT(newUser.ID, cfg.jwtSecret, time.Duration(3600*time.Second))
+	if err != nil {
+		respondWithError(w, 500, err.Error())
+		return
 	}
-	token, err := auth.MakeJWT(newUser.ID, cfg.jwtSecret, time.Duration(expiration*int64(time.Second)))
+	refreshToken, err := auth.MakeRefreshToken()
+	if err != nil {
+		respondWithError(w, 500, err.Error())
+		return
+	}
+	_, err = cfg.db.CreateRefreshToken(req.Context(), database.CreateRefreshTokenParams{
+		Token:     refreshToken,
+		UserID:    newUser.ID,
+		ExpiresAt: time.Now().Add(24 * time.Hour * 60),
+	})
 	if err != nil {
 		respondWithError(w, 500, err.Error())
 		return
 	}
 	respondWithJSON(w, 200, userHiddenPW{
-		ID:        newUser.ID,
-		CreatedAt: newUser.CreatedAt,
-		UpdatedAt: newUser.UpdatedAt,
-		Email:     newUser.Email,
-		Token:     token,
+		ID:           newUser.ID,
+		CreatedAt:    newUser.CreatedAt,
+		UpdatedAt:    newUser.UpdatedAt,
+		Email:        newUser.Email,
+		Token:        token,
+		RefreshToken: refreshToken,
 	})
+}
 
+func (cfg *apiConfig) refreshHandler(w http.ResponseWriter, req *http.Request) {
+	token, err := auth.GetBearerToken(req.Header)
+	if err != nil {
+		respondWithError(w, 401, "missing or invalid authorization header")
+		return
+	}
+	existingToken, err := cfg.db.GetRefreshToken(req.Context(), token)
+	if err != nil {
+		respondWithError(w, 401, "invalid refresh token")
+		return
+	}
+	if existingToken.ExpiresAt.Before(time.Now()) || existingToken.RevokedAt.Valid {
+		respondWithError(w, 401, "refresh token expired")
+		return
+	}
+
+	// If we reach here, the refresh token is valid
+	// Generate a new access token
+	newToken, err := auth.MakeJWT(existingToken.UserID, cfg.jwtSecret, time.Duration(3600*time.Second))
+	if err != nil {
+		respondWithError(w, 500, err.Error())
+		return
+	}
+	respondWithJSON(w, 200, map[string]string{
+		"token": newToken,
+	})
+}
+
+func (cfg *apiConfig) revokeHandler(w http.ResponseWriter, req *http.Request) {
+	token, err := auth.GetBearerToken(req.Header)
+	if err != nil {
+		respondWithError(w, 401, "missing or invalid authorization header")
+		return
+	}
+	existingToken, err := cfg.db.GetRefreshToken(req.Context(), token)
+	if err != nil {
+		respondWithError(w, 401, "invalid refresh token")
+		return
+	}
+	if existingToken.RevokedAt.Valid {
+		respondWithError(w, 400, "refresh token already revoked")
+		return
+	}
+	err = cfg.db.RevokeRefreshToken(req.Context(), token)
+	if err != nil {
+		respondWithError(w, 500, err.Error())
+		return
+	}
+	respondWithJSON(w, 204, map[string]bool{
+		"revoked": true,
+	})
 }
 
 func main() {
@@ -275,6 +339,9 @@ func main() {
 	serveMux.Handle("POST /api/users", http.HandlerFunc(apiCfg.usersHandler))
 
 	serveMux.Handle("POST /api/login", http.HandlerFunc(apiCfg.loginHandler))
+
+	serveMux.Handle("POST /api/refresh", http.HandlerFunc(apiCfg.refreshHandler))
+	serveMux.Handle("POST /api/revoke", http.HandlerFunc(apiCfg.revokeHandler))
 
 	serveMux.HandleFunc("GET /api/healthz", func(w http.ResponseWriter, req *http.Request) {
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
