@@ -307,6 +307,56 @@ func (cfg *apiConfig) revokeHandler(w http.ResponseWriter, req *http.Request) {
 	})
 }
 
+func (cfg *apiConfig) changeUserHandler(w http.ResponseWriter, req *http.Request) {
+	// check access token in the header
+	token, err := auth.GetBearerToken(req.Header)
+	if err != nil {
+		respondWithError(w, 401, "missing or invalid authorization header")
+		return
+	}
+	// check if token is valid and get userID from it
+	userID, err := auth.ValidateJWT(token, cfg.jwtSecret)
+	if err != nil {
+		respondWithError(w, 401, "invalid token")
+		return
+	}
+	// get new email and password from body
+	decoder := json.NewDecoder(req.Body)
+	type updateuser struct {
+		Password string `json:"password"`
+		Email    string `json:"email"`
+	}
+	umail := updateuser{}
+	if err := decoder.Decode(&umail); err != nil {
+		respondWithError(w, 400, err.Error())
+		return
+	}
+	// hash the new password
+	hashedPW, err := auth.HashPassword(umail.Password)
+	if err != nil {
+		respondWithError(w, 500, fmt.Sprintf(`{"error": %s}`, err))
+		return
+	}
+	//update user in db
+	updatedUser, err := cfg.db.UpdateUser(req.Context(), database.UpdateUserParams{
+		ID:             userID,
+		Email:          umail.Email,
+		HashedPassword: hashedPW,
+	})
+	if err != nil {
+		respondWithError(w, 400, err.Error())
+		return
+	}
+	respondWithJSON(w, 200, userHiddenPW{
+		ID:           updatedUser.ID,
+		CreatedAt:    updatedUser.CreatedAt,
+		UpdatedAt:    updatedUser.UpdatedAt,
+		Email:        updatedUser.Email,
+		Token:        "", // do not return password hash
+		RefreshToken: "", // do not return refresh token
+	})
+}
+
 func main() {
 	godotenv.Load()
 	dbURL := os.Getenv("DB_URL")
@@ -337,6 +387,7 @@ func main() {
 	serveMux.Handle("GET /api/chirps/{chirpID}", http.HandlerFunc(apiCfg.singleChirpHandler))
 
 	serveMux.Handle("POST /api/users", http.HandlerFunc(apiCfg.usersHandler))
+	serveMux.Handle("PUT /api/users", http.HandlerFunc(apiCfg.changeUserHandler))
 
 	serveMux.Handle("POST /api/login", http.HandlerFunc(apiCfg.loginHandler))
 
