@@ -357,6 +357,42 @@ func (cfg *apiConfig) changeUserHandler(w http.ResponseWriter, req *http.Request
 	})
 }
 
+func (cfg *apiConfig) deleteSingleChirpHandler(w http.ResponseWriter, req *http.Request) {
+	// check token in the header, if not user not owner of the chirp return 403
+	token, err := auth.GetBearerToken(req.Header)
+	if err != nil {
+		respondWithError(w, 401, "missing or invalid authorization header")
+		return
+	}
+	userID, err := auth.ValidateJWT(token, cfg.jwtSecret)
+	if err != nil {
+		respondWithError(w, 401, "invalid token")
+		return
+	}
+	//check if userID is owner of the chirp
+	chirpID, err := uuid.Parse(req.PathValue("chirpID"))
+	if err != nil {
+		respondWithError(w, 400, "Invalid chirp ID")
+		return
+	}
+	chirp, err := cfg.db.GetChirpByID(req.Context(), chirpID)
+	if err != nil {
+		respondWithError(w, 404, "Chirp not found")
+		return
+	}
+	if chirp.UserID != userID {
+		respondWithError(w, 403, "forbidden: not the owner of the chirp")
+		return
+	}
+	// delete chirp
+	err = cfg.db.DeleteChirpByID(req.Context(), chirpID)
+	if err != nil {
+		respondWithError(w, 404, err.Error())
+		return
+	}
+	respondWithJSON(w, 204, nil)
+}
+
 func main() {
 	godotenv.Load()
 	dbURL := os.Getenv("DB_URL")
@@ -385,6 +421,7 @@ func main() {
 	serveMux.Handle("POST /api/chirps", http.HandlerFunc(apiCfg.chirpsHandler))
 	serveMux.Handle("GET /api/chirps", http.HandlerFunc(apiCfg.getChirpsHandler))
 	serveMux.Handle("GET /api/chirps/{chirpID}", http.HandlerFunc(apiCfg.singleChirpHandler))
+	serveMux.Handle("DELETE /api/chirps/{chirpID}", http.HandlerFunc(apiCfg.deleteSingleChirpHandler))
 
 	serveMux.Handle("POST /api/users", http.HandlerFunc(apiCfg.usersHandler))
 	serveMux.Handle("PUT /api/users", http.HandlerFunc(apiCfg.changeUserHandler))
