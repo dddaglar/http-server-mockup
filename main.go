@@ -7,6 +7,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"sort"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -179,10 +180,32 @@ func (cfg *apiConfig) chirpsHandler(w http.ResponseWriter, req *http.Request) {
 }
 
 func (cfg *apiConfig) getChirpsHandler(w http.ResponseWriter, req *http.Request) {
-	chirps, err := cfg.db.GetChirps(req.Context())
+	// check query parameter author_id, if exists only return the chirps of this user, if not provided same thing
+	authorID := req.URL.Query().Get("author_id")
+	sortBy := req.URL.Query().Get("sort")
+	if sortBy == "" {
+		sortBy = "asc"
+	}
+	var chirps []database.Chirp
+	var err error
+	if authorID != "" {
+		id, err := uuid.Parse(authorID)
+		if err != nil {
+			respondWithError(w, 400, "invalid author_id")
+			return
+		}
+		chirps, err = cfg.db.GetChirpsByAuthorID(req.Context(), id)
+	} else {
+		chirps, err = cfg.db.GetChirps(req.Context())
+	}
 	if err != nil {
 		respondWithError(w, 500, err.Error())
 		return
+	}
+	if sortBy == "desc" {
+		sort.Slice(chirps, func(i, j int) bool {
+			return chirps[i].CreatedAt.After(chirps[j].CreatedAt)
+		})
 	}
 	respondWithJSON(w, 200, chirps)
 }
