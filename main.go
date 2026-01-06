@@ -25,6 +25,7 @@ type apiConfig struct {
 	fileserverHits atomic.Int32
 	db             *database.Queries
 	jwtSecret      string
+	polkaKey       string
 }
 
 type userHiddenPW struct {
@@ -34,6 +35,7 @@ type userHiddenPW struct {
 	Email        string    `json:"email"`
 	Token        string    `json:"token"`
 	RefreshToken string    `json:"refresh_token"`
+	IsChirpyRed  bool      `json:"is_chirpy_red"`
 }
 
 func (cfg *apiConfig) middlewareMetricsInc(next http.Handler) http.Handler {
@@ -136,6 +138,7 @@ func (cfg *apiConfig) usersHandler(w http.ResponseWriter, req *http.Request) {
 		Email:        user.Email,
 		Token:        "", // do not return password hash
 		RefreshToken: "", // do not return refresh token
+		IsChirpyRed:  user.IsChirpyRed,
 	})
 }
 
@@ -251,6 +254,7 @@ func (cfg *apiConfig) loginHandler(w http.ResponseWriter, req *http.Request) {
 		Email:        newUser.Email,
 		Token:        token,
 		RefreshToken: refreshToken,
+		IsChirpyRed:  newUser.IsChirpyRed,
 	})
 }
 
@@ -354,6 +358,7 @@ func (cfg *apiConfig) changeUserHandler(w http.ResponseWriter, req *http.Request
 		Email:        updatedUser.Email,
 		Token:        "", // do not return password hash
 		RefreshToken: "", // do not return refresh token
+		IsChirpyRed:  updatedUser.IsChirpyRed,
 	})
 }
 
@@ -393,6 +398,41 @@ func (cfg *apiConfig) deleteSingleChirpHandler(w http.ResponseWriter, req *http.
 	respondWithJSON(w, 204, nil)
 }
 
+func (cfg *apiConfig) redUpgradeHandler(w http.ResponseWriter, req *http.Request) {
+	// get apikey from header and compare with polkaKey in env
+	apiKey, err := auth.GetAPIKey(req.Header)
+	if err != nil || apiKey != cfg.polkaKey {
+		respondWithError(w, 401, "invalid API key")
+		return
+	}
+	// accept webhook with specific shape
+	webHookEvent := struct {
+		Event string `json:"event"`
+		Data  struct {
+			UserID uuid.UUID `json:"user_id"`
+		} `json:"data"`
+	}{}
+	if err := json.NewDecoder(req.Body).Decode(&webHookEvent); err != nil {
+		respondWithError(w, 400, err.Error())
+		return
+	}
+
+	// if event is not user.upgraded respond with 204
+	if webHookEvent.Event != "user.upgraded" {
+		respondWithJSON(w, 204, nil)
+		return
+	}
+
+	// upgrade user to chirpy red in the database
+	_, err = cfg.db.UpgradeUserToChirpyRed(req.Context(), webHookEvent.Data.UserID)
+	if err != nil {
+		respondWithError(w, 404, err.Error())
+		return
+	}
+	respondWithJSON(w, 204, nil)
+
+}
+
 func main() {
 	godotenv.Load()
 	dbURL := os.Getenv("DB_URL")
@@ -403,7 +443,8 @@ func main() {
 
 	dbQueries := database.New(db)
 	jwtsecret := os.Getenv("SECRET_KEY")
-	apiCfg := apiConfig{db: dbQueries, jwtSecret: jwtsecret}
+	polkaKey := os.Getenv("POLKA_KEY")
+	apiCfg := apiConfig{db: dbQueries, jwtSecret: jwtsecret, polkaKey: polkaKey}
 
 	port := "8080"
 	serveMux := http.NewServeMux()
@@ -430,6 +471,8 @@ func main() {
 
 	serveMux.Handle("POST /api/refresh", http.HandlerFunc(apiCfg.refreshHandler))
 	serveMux.Handle("POST /api/revoke", http.HandlerFunc(apiCfg.revokeHandler))
+
+	serveMux.Handle("POST /api/polka/webhooks", http.HandlerFunc(apiCfg.redUpgradeHandler))
 
 	serveMux.HandleFunc("GET /api/healthz", func(w http.ResponseWriter, req *http.Request) {
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")

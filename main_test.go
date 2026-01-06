@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -15,6 +16,12 @@ import (
 	"github.com/dddaglar/http_server_mockup/internal/database"
 	"github.com/google/uuid"
 	_ "github.com/lib/pq"
+)
+
+const (
+	testJWTSecret = "test-secret-key"
+	testUserEmail = "test@example.com"
+	testUserPass  = "securepassword123"
 )
 
 // HELPER FUNCTION TESTS (No Database Required)
@@ -103,6 +110,7 @@ func TestReplaceProfane(t *testing.T) {
 		// t.Run creates a subtest - this gives better error messages and allows
 		// running individual tests with: go test -run TestReplaceProfane/name
 		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
 			got := replaceProfane(tt.input)
 			if got != tt.want {
 				// Clear error message shows what went wrong
@@ -431,7 +439,6 @@ func TestHealthzHandler(t *testing.T) {
 			name: "returns 200 OK",
 			check: func(t *testing.T) {
 				// Create the request
-				w := HealthzHandlerHelper(t)
 				// Verify status code
 				if w.Code != http.StatusOK {
 					t.Errorf("status code = %d, want %d", w.Code, http.StatusOK)
@@ -441,7 +448,6 @@ func TestHealthzHandler(t *testing.T) {
 		{
 			name: "returns OK in body",
 			check: func(t *testing.T) {
-				w := HealthzHandlerHelper(t)
 				// Verify response body
 				if got := w.Body.String(); got != "OK" {
 					t.Errorf("body = %q, want %q", got, "OK")
@@ -451,7 +457,6 @@ func TestHealthzHandler(t *testing.T) {
 		{
 			name: "sets correct Content-Type header",
 			check: func(t *testing.T) {
-				w := HealthzHandlerHelper(t)
 				// Verify Content-Type header
 				want := "text/plain; charset=utf-8"
 				if got := w.Header().Get("Content-Type"); got != want {
@@ -469,13 +474,19 @@ func TestHealthzHandler(t *testing.T) {
 }
 
 // TestMetricHandler tests the admin metrics endpoint
+func helpTestMetricHandler(t *testing.T) *httptest.ResponseRecorder {
+	t.Helper()
+	cfg := &apiConfig{}
+	req := httptest.NewRequest(http.MethodGet, "/admin/metrics", nil)
+	w := httptest.NewRecorder()
+
+	cfg.metricHandler(w, req)
+	return w
+
+}
 func TestMetricHandler(t *testing.T) {
 	t.Run("returns 200 OK", func(t *testing.T) {
-		cfg := &apiConfig{}
-		req := httptest.NewRequest(http.MethodGet, "/admin/metrics", nil)
-		w := httptest.NewRecorder()
-
-		cfg.metricHandler(w, req)
+		w := helpTestMetricHandler(t)
 
 		if w.Code != http.StatusOK {
 			t.Errorf("status code = %d, want %d", w.Code, http.StatusOK)
@@ -483,11 +494,7 @@ func TestMetricHandler(t *testing.T) {
 	})
 
 	t.Run("returns HTML content type", func(t *testing.T) {
-		cfg := &apiConfig{}
-		req := httptest.NewRequest(http.MethodGet, "/admin/metrics", nil)
-		w := httptest.NewRecorder()
-
-		cfg.metricHandler(w, req)
+		w := helpTestMetricHandler(t)
 
 		want := "text/html; charset=utf-8"
 		if got := w.Header().Get("Content-Type"); got != want {
@@ -496,13 +503,7 @@ func TestMetricHandler(t *testing.T) {
 	})
 
 	t.Run("displays correct hit count - zero", func(t *testing.T) {
-		cfg := &apiConfig{}
-		// Don't increment, should be 0
-		req := httptest.NewRequest(http.MethodGet, "/admin/metrics", nil)
-		w := httptest.NewRecorder()
-
-		cfg.metricHandler(w, req)
-
+		w := helpTestMetricHandler(t)
 		body := w.Body.String()
 		// Should contain "0 times" in the HTML
 		if !strings.Contains(body, "0 times") {
@@ -528,11 +529,7 @@ func TestMetricHandler(t *testing.T) {
 	})
 
 	t.Run("contains expected HTML elements", func(t *testing.T) {
-		cfg := &apiConfig{}
-		req := httptest.NewRequest(http.MethodGet, "/admin/metrics", nil)
-		w := httptest.NewRecorder()
-
-		cfg.metricHandler(w, req)
+		w := helpTestMetricHandler(t)
 
 		body := w.Body.String()
 
@@ -565,59 +562,69 @@ func TestResetHandler_NonDevEnvironment(t *testing.T) {
 		os.Setenv("PLATFORM", originalPlatform)
 	}()
 
-	t.Run("returns 403 when not in dev environment", func(t *testing.T) {
-		// Set environment to production
-		os.Setenv("PLATFORM", "prod")
+	tests := []struct {
+		name      string
+		platform  string // The PLATFORM env value to test
+		wantCode  int
+		wantError string
+		wantCType string
+	}{
+		{
+			name:      "prod environment returns 403",
+			platform:  "prod",
+			wantCode:  http.StatusForbidden,
+			wantError: "can only be accessed in a local dev env",
+			wantCType: "application/json",
+		},
+		{
+			name:      "production environment returns 403",
+			platform:  "production",
+			wantCode:  http.StatusForbidden,
+			wantError: "can only be accessed in a local dev env",
+			wantCType: "application/json",
+		},
+		{
+			name:      "staging environment returns 403",
+			platform:  "staging",
+			wantCode:  http.StatusForbidden,
+			wantError: "can only be accessed in a local dev env",
+			wantCType: "application/json",
+		},
+	}
 
-		cfg := &apiConfig{}
-		req := httptest.NewRequest(http.MethodPost, "/admin/reset", nil)
-		w := httptest.NewRecorder()
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// Set the environment for this test case
+			os.Setenv("PLATFORM", tt.platform)
 
-		cfg.resetHandler(w, req)
+			cfg := &apiConfig{}
+			req := httptest.NewRequest(http.MethodPost, "/admin/reset", nil)
+			w := httptest.NewRecorder()
 
-		// Should return 403 Forbidden
-		if w.Code != http.StatusForbidden {
-			t.Errorf("status code = %d, want %d", w.Code, http.StatusForbidden)
-		}
-	})
+			cfg.resetHandler(w, req)
 
-	t.Run("returns correct error message for non-dev", func(t *testing.T) {
-		os.Setenv("PLATFORM", "production")
+			// Verify status code
+			if w.Code != tt.wantCode {
+				t.Errorf("status code = %d, want %d", w.Code, tt.wantCode)
+			}
 
-		cfg := &apiConfig{}
-		req := httptest.NewRequest(http.MethodPost, "/admin/reset", nil)
-		w := httptest.NewRecorder()
+			// Verify error message
+			var response struct {
+				Error string `json:"error"`
+			}
+			if err := json.NewDecoder(w.Body).Decode(&response); err != nil {
+				t.Fatalf("failed to decode response: %v", err)
+			}
+			if response.Error != tt.wantError {
+				t.Errorf("error message = %q, want %q", response.Error, tt.wantError)
+			}
 
-		cfg.resetHandler(w, req)
-
-		// Parse response
-		var response struct {
-			Error string `json:"error"`
-		}
-		if err := json.NewDecoder(w.Body).Decode(&response); err != nil {
-			t.Fatalf("failed to decode response: %v", err)
-		}
-
-		// Verify error message
-		want := "can only be accessed in a local dev env"
-		if response.Error != want {
-			t.Errorf("error message = %q, want %q", response.Error, want)
-		}
-	})
-
-	t.Run("returns JSON content type even on error", func(t *testing.T) {
-		os.Setenv("PLATFORM", "staging")
-
-		cfg := &apiConfig{}
-		req := httptest.NewRequest(http.MethodPost, "/admin/reset", nil)
-		w := httptest.NewRecorder()
-
-		cfg.resetHandler(w, req)
-
-		if got := w.Header().Get("Content-Type"); got != "application/json" {
-			t.Errorf("Content-Type = %q, want %q", got, "application/json")
-		}
-	})
+			// Verify Content-Type header
+			if got := w.Header().Get("Content-Type"); got != tt.wantCType {
+				t.Errorf("Content-Type = %q, want %q", got, tt.wantCType)
+			}
+		})
+	}
 }
 
 // INTEGRATION TESTS (Require Database)
@@ -687,12 +694,12 @@ func TestUsersHandler_Integration(t *testing.T) {
 	// Create apiConfig with test database
 	cfg := &apiConfig{
 		db:        dbQueries,
-		jwtSecret: "test-secret-key",
+		jwtSecret: testJWTSecret,
 	}
 
 	t.Run("creates user successfully", func(t *testing.T) {
 		// Prepare request body with user data
-		reqBody := `{"email":"test@example.com","password":"securepassword123"}`
+		reqBody := fmt.Sprintf(`{"email":"%s","password":"%s"}`, testUserEmail, testUserPass)
 		req := httptest.NewRequest(http.MethodPost, "/api/users", strings.NewReader(reqBody))
 		req.Header.Set("Content-Type", "application/json")
 
@@ -714,8 +721,8 @@ func TestUsersHandler_Integration(t *testing.T) {
 		}
 
 		// VERIFY: Response contains expected fields
-		if response.Email != "test@example.com" {
-			t.Errorf("email = %q, want %q", response.Email, "test@example.com")
+		if response.Email != testUserEmail {
+			t.Errorf("email = %q, want %q", response.Email, testUserEmail)
 		}
 		if response.ID == uuid.Nil {
 			t.Error("user ID should not be nil")
@@ -737,7 +744,7 @@ func TestUsersHandler_Integration(t *testing.T) {
 
 		// VERIFY: User is actually in the database
 		ctx := context.Background()
-		dbUser, err := dbQueries.GetUserByMail(ctx, "test@example.com")
+		dbUser, err := dbQueries.GetUserByMail(ctx, testUserEmail)
 		if err != nil {
 			t.Fatalf("failed to retrieve user from database: %v", err)
 		}
@@ -746,12 +753,12 @@ func TestUsersHandler_Integration(t *testing.T) {
 		if dbUser.ID != response.ID {
 			t.Errorf("database user ID = %v, want %v", dbUser.ID, response.ID)
 		}
-		if dbUser.Email != "test@example.com" {
-			t.Errorf("database user email = %q, want %q", dbUser.Email, "test@example.com")
+		if dbUser.Email != testUserEmail {
+			t.Errorf("database user email = %q, want %q", dbUser.Email, testUserEmail)
 		}
 
 		// VERIFY: Password is hashed, not stored in plaintext
-		if dbUser.HashedPassword == "securepassword123" {
+		if dbUser.HashedPassword == testUserPass {
 			t.Error("password should be hashed, not stored as plaintext")
 		}
 		// Hashed password should be non-empty and different from original
@@ -770,7 +777,7 @@ func TestLoginHandler_Integration(t *testing.T) {
 
 	cfg := &apiConfig{
 		db:        dbQueries,
-		jwtSecret: "test-secret-key",
+		jwtSecret: testJWTSecret,
 	}
 
 	t.Run("login with valid credentials", func(t *testing.T) {
@@ -823,7 +830,7 @@ func TestLoginHandler_Integration(t *testing.T) {
 
 		// VERIFY: Access token is valid JWT
 		// We can decode it to verify it contains the user ID
-		userID, err := auth.ValidateJWT(response.Token, "test-secret-key")
+		userID, err := auth.ValidateJWT(response.Token, testJWTSecret)
 		if err != nil {
 			t.Errorf("JWT validation failed: %v", err)
 		}
@@ -863,7 +870,7 @@ func TestChirpsHandler_Integration(t *testing.T) {
 
 	cfg := &apiConfig{
 		db:        dbQueries,
-		jwtSecret: "test-secret-key",
+		jwtSecret: testJWTSecret,
 	}
 
 	t.Run("creates chirp with valid auth token", func(t *testing.T) {

@@ -77,3 +77,12 @@ func MakeRefreshToken() (string, error) {
 	}
 	return hex.EncodeToString(newTokenUUID), nil
 }
+
+func GetAPIKey(headers http.Header) (string, error) {
+	apiKey := headers.Get("Authorization")
+	apiKey = strings.TrimPrefix(apiKey, "ApiKey ")
+	if len(apiKey) == 0 {
+		return "", http.ErrNoCookie
+	}
+	return apiKey, nil
+}
