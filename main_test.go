@@ -910,7 +910,7 @@ func TestChirpsHandler_Integration(t *testing.T) {
 		// Call chirps handler
 		cfg.chirpsHandler(chirpW, chirpReq)
 
-		// VERIFY: Status code should be 201 Created
+		// VERIFY: Status code should be 201 Create
 		if chirpW.Code != http.StatusCreated {
 			t.Errorf("status code = %d, want %d. Body: %s", chirpW.Code, http.StatusCreated, chirpW.Body.String())
 		}
